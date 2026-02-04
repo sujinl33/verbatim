@@ -189,6 +189,16 @@ def run_alignment(
                         t["token_1_position"] : t["token_1_position"] + t["length"]
                     ]
                 ),
+                "story_local_context":
+                    tokens_sequence_1[
+                        t["token_1_position"]-PRE_FOLLOW_WINDOW : t["token_1_position"] + t["length"]+PRE_FOLLOW_WINDOW
+                    ]
+                ,
+                "recall_local_context":
+                    tokens_sequence_2[
+                        t["token_2_position"]-PRE_FOLLOW_WINDOW : t["token_2_position"] + t["length"]+PRE_FOLLOW_WINDOW
+                    ]
+                ,
                 "story_start": t["token_1_position"],
                 "story_end": t["token_1_position"] + t["length"] - 1,
                 "recall_start": t["token_2_position"],
