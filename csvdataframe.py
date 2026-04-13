@@ -1,29 +1,26 @@
+"""
+Smith-Waterman and GST analysis pipeline for story-recall alignment.
+Intended output: CSV summaries and debugging tables.
+"""
+
 from pathlib import Path
 import re
-import random
-import traceback  # for debug stack traces
-
+import traceback
 from gst_calculation import gst
 from minineedle import smith, core
 from minineedle.core import Gap
-
 import pandas as pd
 import numpy as np
-import spacy
-
 pd.set_option("display.max_colwidth", None)
 
-#edit as needed
+#file paths (edit as needed)
 BASE = Path("/Users/isujin/Desktop/verbatim")
-
+#directories:
 STORY_SUBDIR = "story_transcript"
 RECALL_SUBDIR = "recall_transcript"
-
+#file naming patterns:
 STORY_SUFFIX = "_transcript.txt"  # story "eyespy" -> "eyespy_transcript.txt"
 RECALL_PATTERN = "P{participant}_{story}.txt"  # -> "P100_eyespy.txt"
-
-PRE_FOLLOW_WINDOW = 50  # number of preceding/following tokens to use
-
 
 #========================
 #helper functions
@@ -53,6 +50,33 @@ def _safe_div(num, denom, context=""):
         return 0.0
     return float(num) / float(denom)
 
+def add_segment_metrics(group: pd.DataFrame):
+            ops = group["operation"].value_counts()
+            M = int(ops.get("M", 0))
+            S = int(ops.get("S", 0))
+            I = int(ops.get("I", 0))
+            D = int(ops.get("D", 0))
+            L = len(group)
+            mr = _safe_div(M, L, context=f"segment {group.name}")
+            nmr = _safe_div(S + I + D, L, context=f"segment {group.name}")
+            group["segment_MatchRate"] = mr
+            group["segment_NonMatchRate"] = nmr
+            group["segment_ExactLexicalMatches"] = M
+            group["segment_story_len"] = L  
+            group["segment_recall_len"] = L
+            return group
+
+def compute_op(row):
+            a = row["story_tok_norm"]
+            b = row["recall_tok_norm"]
+            if a is not None and a != "" and b is not None and b != "":
+                return "M" if a == b else "S"
+            elif a is not None and a != "":
+                return "D"
+            elif b is not None and b != "":
+                return "I"
+            else:
+                return "?"
 
 def _safe_sw_align(seq1, seq2, score_matrix, context="", debug=False):
     """
@@ -87,27 +111,20 @@ def _safe_sw_align(seq1, seq2, score_matrix, context="", debug=False):
             traceback.print_exc()
         return [], []
 
-
 #========================
-#normalization / NLP
-
-nlp = spacy.load("en_core_web_sm")
-
+#normalization
 # strip leading/trailing punctuation; lowercase
 _norm = lambda s: re.sub(r"^\W+|\W+$", "", str(s).lower())
 
-
 #========================
 #core alignment pipeline
-
 def run_alignment(
     story_name,
     participant_number,
     other_participant_number=None,
     debug=False,
-    null_mode=False,
     minimal_match=3,
-    score_params=[2, -1, -2],
+    score_params=[2, -1, -2]
 ):
     print(
         f"\n=== run_alignment(story={story_name}, "
@@ -141,12 +158,7 @@ def run_alignment(
         )
         first_tokens_raw = safe_read(other_recall_path)
         first_tokens_norm = [_norm(t) for t in first_tokens_raw]
-
-    if null_mode:
-        shuffled = second_tokens_norm.copy()
-        random.shuffle(shuffled)
-        second_tokens_norm = shuffled
-
+        
     tokens_sequence_1 = first_tokens_norm     # normalized story / first side
     tokens_sequence_2 = second_tokens_norm    # normalized recall / second side
 
@@ -168,16 +180,16 @@ def run_alignment(
         return empty_gst, empty_pairs, empty_global
     
     #GST
-    tiles, total_score = gst.calculate(
-        tokens_sequence_1, tokens_sequence_2, minimal_match=minimal_match
-    )
+    tiles, total_score = gst.calculate(tokens_sequence_1, tokens_sequence_2, minimal_match=minimal_match)
 
     if debug:
         print(f"#GST tiles: {len(tiles)}   (total_score={total_score})")
 
     df_gst = pd.DataFrame(
         [
-            {
+            {   "story": story_name,
+                "participant": participant_number,
+                "tile_id": i,
                 "text_raw": " ".join(
                     first_tokens_raw[
                         t["token_1_position"] : t["token_1_position"] + t["length"]
@@ -195,27 +207,15 @@ def run_alignment(
                 "len_tokens": t["length"],
                 "minimal_match": minimal_match,
             }
-            for t in tiles
+            for i, t in enumerate(tiles)
         ]
     )
-    if score_params is None:
-        score_params = [2, -1, -2]
 
-    score_matrix = core.ScoreMatrix(
-        match=score_params[0],
-        miss=score_params[1],
-        gap=score_params[2],
-    )
+    score_matrix = core.ScoreMatrix(*score_params)
+
     if not df_gst.empty:
-        df_gst["tile_id"] = df_gst.index.astype(int)
-        df_gst["story"] = story_name
-        df_gst["participant"] = participant_number
-        df_gst = df_gst.reset_index(drop=True)
-        front_cols = ["story", "participant", "tile_id"]
-        df_gst = df_gst[front_cols + [c for c in df_gst.columns if c not in front_cols]]
-
-        # ---- build context windows: before + tile + after ----
-        GST_WINDOW = 30  # or reuse PRE_FOLLOW_WINDOW
+        #build context windows: before + tile + after
+        GST_WINDOW = 30  
         story_context_raw = []
         recall_context_raw = []
 
@@ -236,19 +236,13 @@ def run_alignment(
         df_gst["story_context_raw"] = story_context_raw
         df_gst["recall_context_raw"] = recall_context_raw
 
-    #GLOBAL Smith–Waterman (full story vs recall)
+    #Smith–Waterman
     al1_norm, al2_norm = _safe_sw_align(
         tokens_sequence_1,
         tokens_sequence_2,
         score_matrix,
         context="global",
         debug=debug,
-    )
-
-    sw_match, sw_mismatch, sw_gap = (
-        score_matrix.match,
-        score_matrix.miss,
-        score_matrix.gap,
     )
 
     rows_full = []
@@ -278,106 +272,43 @@ def run_alignment(
     df_sw_global = pd.DataFrame(rows_full)
 
     if not df_sw_global.empty:
-        def map_story_norm(idx):
+        def map_idx_to_token(idx, tokens_sequence):
             if pd.isna(idx):
                 return None
             idx = int(idx)
-            return tokens_sequence_1[idx] if 0 <= idx < len(tokens_sequence_1) else None
+            return tokens_sequence[idx] if 0 <= idx < len(tokens_sequence) else None
 
-        def map_recall_norm(idx):
-            if pd.isna(idx):
-                return None
-            idx = int(idx)
-            return tokens_sequence_2[idx] if 0 <= idx < len(tokens_sequence_2) else None
+        df_sw_global["story_tok_norm"] = df_sw_global["story_idx"].map(lambda idx: map_idx_to_token(idx, tokens_sequence_1))
+        df_sw_global["recall_tok_norm"] = df_sw_global["recall_idx"].map(lambda idx: map_idx_to_token(idx, tokens_sequence_2))
+        df_sw_global["story_tok"] = df_sw_global["story_idx"].map(lambda idx: map_idx_to_token(idx, first_tokens_raw))
+        df_sw_global["recall_tok"] = df_sw_global["recall_idx"].map(lambda idx: map_idx_to_token(idx, second_tokens_raw))
 
-        def map_story_raw(idx):
-            if pd.isna(idx):
-                return None
-            idx = int(idx)
-            return first_tokens_raw[idx] if 0 <= idx < len(first_tokens_raw) else None
-
-        def map_recall_raw(idx):
-            if pd.isna(idx):
-                return None
-            idx = int(idx)
-            return second_tokens_raw[idx] if 0 <= idx < len(second_tokens_raw) else None
-
-        df_sw_global["story_tok_norm"] = df_sw_global["story_idx"].map(map_story_norm)
-        df_sw_global["recall_tok_norm"] = df_sw_global["recall_idx"].map(map_recall_norm)
-        df_sw_global["story_tok"] = df_sw_global["story_idx"].map(map_story_raw)
-        df_sw_global["recall_tok"] = df_sw_global["recall_idx"].map(map_recall_raw)
-
-        #recompute operation *from norms* to ensure consistency
-        def compute_op(row):
-            a = row["story_tok_norm"]
-            b = row["recall_tok_norm"]
-            if a is not None and a != "" and b is not None and b != "":
-                return "M" if a == b else "S"
-            elif a is not None and a != "":
-                return "D"
-            elif b is not None and b != "":
-                return "I"
-            else:
-                return "?"
-
+        #recompute operation from norms to ensure consistency
         df_sw_global["operation"] = df_sw_global.apply(compute_op, axis=1)
 
-        #run-level metrics from recomputed ops
-        op_counts = df_sw_global["operation"].value_counts()
-        M_full = int(op_counts.get("M", 0))
-        S_full = int(op_counts.get("S", 0))
-        I_full = int(op_counts.get("I", 0))
-        D_full = int(op_counts.get("D", 0))
+        #global metadata
+        df_sw_global.insert(1, "story", story_name)
+        df_sw_global.insert(2, "participant", participant_number)
+        df_sw_global.insert(3, "segment", "global")
+        df_sw_global = df_sw_global.groupby(
+            ["story", "participant", "segment"],
+            as_index=False,
+            group_keys=False,
+        ).apply(add_segment_metrics, include_groups=True)
 
-        T_full = len(df_sw_global)
-        if debug:
-            print(f"Global SW T_full (rows): {T_full}")
-            print(f"M_full={M_full}, S_full={S_full}, I_full={I_full}, D_full={D_full}")
-
-        MatchRate = _safe_div(M_full, T_full, context="global MatchRate")
-        NonMatchRate = _safe_div(
-            S_full + I_full + D_full, T_full, context="global NonMatchRate"
-        )
-
+        #unique id
+        df_sw_global["pair_id"] = np.arange(len(df_sw_global))
+    
         _gst_covered = int(df_gst["len_tokens"].sum()) if not df_gst.empty else 0
         _story_len = len(tokens_sequence_1)
         if debug:
             print(f"GST covered tokens: {_gst_covered}, story_len: {_story_len}")
-        GSTCoverage = _safe_div(_gst_covered, _story_len, context="GSTCoverage")
-        ExactLexicalMatches = M_full
-
-        #global metadata
-        df_sw_global["story"] = story_name
-        df_sw_global["participant"] = participant_number
-        df_sw_global["segment"] = "global"
-        df_sw_global["sw_match"] = sw_match
-        df_sw_global["sw_mismatch"] = sw_mismatch
-        df_sw_global["sw_gap"] = sw_gap
-        df_sw_global["gst_minimal_match"] = minimal_match
-        df_sw_global["MatchRate"] = MatchRate
-        df_sw_global["NonMatchRate"] = NonMatchRate
-        df_sw_global["GSTCoverage"] = GSTCoverage
-        df_sw_global["ExactLexicalMatches"] = ExactLexicalMatches
-
-        #unique id
-        df_sw_global["pair_id"] = np.arange(len(df_sw_global))
-
-        front_cols = [
-            "pair_id",
-            "story",
-            "participant",
-            "segment",
-            "aligned_pos",
-            "story_tok",
-            "recall_tok",
-        ]
-        other_cols = [c for c in df_sw_global.columns if c not in front_cols]
-        df_sw_global = df_sw_global[front_cols + other_cols]
 
     else:
         if debug:
             print("Global SW produced no rows; df_sw_global is empty.")
 
+    #context level SW pairs
     sw_pairs_rows = []
 
     for _, tile in df_gst.iterrows():
@@ -414,12 +345,8 @@ def run_alignment(
 
             story_tok_norm = s_ctx_norm[story_idx] if story_idx is not None else None
             recall_tok_norm = r_ctx_norm[recall_idx] if recall_idx is not None else None
-            story_tok_raw = (
-                story_ctx_raw_tokens[story_idx] if story_idx is not None else None
-            )
-            recall_tok_raw = (
-                recall_ctx_raw_tokens[recall_idx] if recall_idx is not None else None
-            )
+            story_tok_raw = (story_ctx_raw_tokens[story_idx] if story_idx is not None else None)
+            recall_tok_raw = (recall_ctx_raw_tokens[recall_idx] if recall_idx is not None else None)
 
             sw_pairs_rows.append(
                 {
@@ -442,37 +369,8 @@ def run_alignment(
     df_sw_pairs = pd.DataFrame(sw_pairs_rows)
 
     if not df_sw_pairs.empty:
-        #recompute operation from norms so it always matches
-        def compute_op(row):
-            a = row["story_tok_norm"]
-            b = row["recall_tok_norm"]
-            if a is not None and a != "" and b is not None and b != "":
-                return "M" if a == b else "S"
-            elif a is not None and a != "":
-                return "D"
-            elif b is not None and b != "":
-                return "I"
-            else:
-                return "?"
-
+        #recompute operation from norms
         df_sw_pairs["operation"] = df_sw_pairs.apply(compute_op, axis=1)
-
-        #segment-level metrics per (story, participant, tile_id, segment)
-        def add_segment_metrics(group: pd.DataFrame):
-            ops = group["operation"].value_counts()
-            M = int(ops.get("M", 0))
-            S = int(ops.get("S", 0))
-            I = int(ops.get("I", 0))
-            D = int(ops.get("D", 0))
-            L = len(group)
-            mr = _safe_div(M, L, context=f"segment {group.name}")
-            nmr = _safe_div(S + I + D, L, context=f"segment {group.name}")
-            group["segment_MatchRate"] = mr
-            group["segment_NonMatchRate"] = nmr
-            group["segment_ExactLexicalMatches"] = M
-            group["segment_story_len"] = L  
-            group["segment_recall_len"] = L
-            return group
 
         df_sw_pairs = df_sw_pairs.groupby(
             ["story", "participant", "tile_id", "segment"],
@@ -482,20 +380,6 @@ def run_alignment(
 
         #unique id
         df_sw_pairs["pair_id"] = np.arange(len(df_sw_pairs))
-
-        #order columns
-        front_cols = [
-            "pair_id",
-            "story",
-            "participant",
-            "tile_id",
-            "segment",
-            "aligned_pos",
-            "story_tok",
-            "recall_tok",
-        ]
-        other_cols = [c for c in df_sw_pairs.columns if c not in front_cols]
-        df_sw_pairs = df_sw_pairs[front_cols + other_cols]
 
         # categorical op
         df_sw_pairs["operation"] = pd.Categorical(
@@ -515,7 +399,6 @@ def run_alignment(
         print("=====================\n")
 
     return df_gst, df_sw_pairs, df_sw_global
-
 
 
 #batch runner
@@ -555,7 +438,6 @@ def run_all(
                         participant_number=participant,
                         other_participant_number=None,
                         debug=debug,
-                        null_mode=False,
                         minimal_match=minimal_match,
                         score_params=score_params,
                     )
@@ -582,7 +464,6 @@ def run_all(
                         participant_number=participant,
                         other_participant_number=None,
                         debug=debug,
-                        null_mode=False,
                         minimal_match=minimal_match,
                         score_params=score_params,
                     )
@@ -603,7 +484,6 @@ def run_all(
                 participant_number=participant_number,
                 other_participant_number=other_participant_number,
                 debug=debug,
-                null_mode=False,
                 minimal_match=minimal_match,
                 score_params=score_params,
             )
@@ -636,12 +516,8 @@ def run_all(
             )
 
     all_gst_df = pd.concat(all_gst, ignore_index=True) if all_gst else pd.DataFrame()
-    all_sw_pairs_df = (
-        pd.concat(all_sw_pairs, ignore_index=True) if all_sw_pairs else pd.DataFrame()
-    )
-    all_sw_global_df = (
-        pd.concat(all_sw_global, ignore_index=True) if all_sw_global else pd.DataFrame()
-    )
+    all_sw_pairs_df = (pd.concat(all_sw_pairs, ignore_index=True) if all_sw_pairs else pd.DataFrame())
+    all_sw_global_df = (pd.concat(all_sw_global, ignore_index=True) if all_sw_global else pd.DataFrame())
 
     # save
     if save:
@@ -649,26 +525,16 @@ def run_all(
         score_tag = f"m{match}_mm{mismatch}_g{gap}"
 
         if not all_gst_df.empty:
-            all_gst_df.to_csv(
-                BASE / f"gst_{save_tag_base}_{minimal_match}.csv",
-                index=False,
-            )
+            all_gst_df.to_csv(BASE / f"gst_{save_tag_base}_{minimal_match}.csv", index=False)
         if not all_sw_pairs_df.empty:
-            all_sw_pairs_df.to_csv(
-                BASE / f"sw_context_pairs_{save_tag_base}_{score_tag}.csv",
-                index=False,
-            )
+            all_sw_pairs_df.to_csv(BASE / f"sw_context_pairs_{save_tag_base}_{score_tag}.csv", index=False)
         if not all_sw_global_df.empty:
-            all_sw_global_df.to_csv(
-                BASE / f"sw_global_{save_tag_base}_{score_tag}.csv",
-                index=False,
-            )
+            all_sw_global_df.to_csv(BASE / f"sw_global_{save_tag_base}_{score_tag}.csv", index=False)
 
     return all_gst_df, all_sw_pairs_df, all_sw_global_df
 
-
 if __name__ == "__main__":
     # example: one participant
-    print(run_all("pieman", debug=False, save=True))
+    print(run_all("pieman", participant_number=12, debug=True, save=True, score_params=[2, -1, -2]))
     # example: all participants for eyespy
     # print(run_all("eyespy", participant_number=None, debug=True, save=True))
